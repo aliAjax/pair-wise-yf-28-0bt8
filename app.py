@@ -18,9 +18,9 @@ MAX_ARM_LENGTH = 40
 
 
 class BusinessError(Exception):
-    def __init__(self, message, status=400, code="bad_request"):
+    def __init__(self, message, status=400, code="bad_request", extra=None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.extra = message, status, code, extra or {}
 
 
 def now():
@@ -95,8 +95,62 @@ class RandomizationStore:
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
                     detail TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reservations(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    stratum_id INTEGER NOT NULL REFERENCES strata(id),
+                    site_id TEXT NOT NULL,
+                    seq_start INTEGER NOT NULL DEFAULT 0,
+                    seq_end INTEGER NOT NULL DEFAULT 0,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active','queued','expired','cancelled')),
+                    expires_at TEXT,
+                    queue_no INTEGER,
+                    requested_count INTEGER NOT NULL,
+                    fulfilled_at TEXT,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS drug_records(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    site_id TEXT NOT NULL,
+                    reservation_id INTEGER REFERENCES reservations(id),
+                    allocation_id INTEGER UNIQUE REFERENCES allocations(id),
+                    pack_no TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'stocked'
+                        CHECK(status IN ('stocked','dispensed','returned')),
+                    stocked_at TEXT NOT NULL,
+                    dispensed_at TEXT,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    UNIQUE(trial_id, pack_no)
+                );
                 """
             )
+            self._migrate_columns(conn)
+            conn.executescript(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_active_range
+                    ON reservations(stratum_id, seq_start) WHERE status='active';
+                CREATE INDEX IF NOT EXISTS idx_allocations_reservation ON allocations(reservation_id);
+                CREATE INDEX IF NOT EXISTS idx_reservations_stratum ON reservations(stratum_id, status);
+                CREATE INDEX IF NOT EXISTS idx_drug_records_reservation ON drug_records(reservation_id);
+                """
+            )
+
+    @staticmethod
+    def _columns(conn, table):
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+    def _migrate_columns(self, conn):
+        for table, column, ddl in (
+            ("strata", "planned_count", "INTEGER NOT NULL DEFAULT 50"),
+            ("trials", "stratum_planned", "INTEGER NOT NULL DEFAULT 50"),
+            ("allocations", "reservation_id", "INTEGER REFERENCES reservations(id)"),
+        ):
+            if column not in self._columns(conn, table):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def seed(self):
         self.init_schema()
@@ -134,7 +188,7 @@ class RandomizationStore:
             (trial_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
         )
 
-    def create_trial(self, user_id, name, protocol_version, arms, strata_factors, block_size, seed):
+    def create_trial(self, user_id, name, protocol_version, arms, strata_factors, block_size, seed, stratum_planned=50):
         name = name.strip()
         if len(name) < 3 or not protocol_version.strip() or len(seed.strip()) < 8:
             raise BusinessError("试验名称、方案版本和至少 8 位随机种子不能为空", 422, "invalid_trial")
@@ -147,19 +201,21 @@ class RandomizationStore:
             raise BusinessError("分层因素必须是非空且不重复的数组", 422, "invalid_strata")
         if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < len(arms) or block_size % len(arms) != 0:
             raise BusinessError("区组长度必须为试验组数的正整数倍", 422, "invalid_block_size")
+        if isinstance(stratum_planned, bool) or not isinstance(stratum_planned, int) or stratum_planned < 2 or stratum_planned > 100000:
+            raise BusinessError("分层计划人数必须为 2..100000 的整数", 422, "invalid_planned")
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"coordinator"})
             try:
                 cur = conn.execute(
-                    """INSERT INTO trials(name,protocol_version,arms_json,strata_factors_json,block_size,seed,created_by,created_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (name, protocol_version.strip(), json.dumps(arms), json.dumps([str(x).strip() for x in strata_factors]), block_size, seed.strip(), user_id, now()),
+                    """INSERT INTO trials(name,protocol_version,arms_json,strata_factors_json,block_size,seed,created_by,created_at,stratum_planned)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (name, protocol_version.strip(), json.dumps(arms), json.dumps([str(x).strip() for x in strata_factors]), block_size, seed.strip(), user_id, now(), stratum_planned),
                 )
             except sqlite3.IntegrityError:
                 raise BusinessError("试验名称已存在", 409, "trial_exists")
             trial_id = cur.lastrowid
-            self._audit(conn, trial_id, user_id, "trial.create", {"protocol_version": protocol_version, "arms": len(arms), "block_size": block_size})
-            return {"id": trial_id, "name": name, "status": "draft", "arms": arms, "strata_factors": strata_factors, "block_size": block_size}
+            self._audit(conn, trial_id, user_id, "trial.create", {"protocol_version": protocol_version, "arms": len(arms), "block_size": block_size, "stratum_planned": stratum_planned})
+            return {"id": trial_id, "name": name, "status": "draft", "arms": arms, "strata_factors": strata_factors, "block_size": block_size, "stratum_planned": stratum_planned}
 
     def update_protocol(self, user_id, trial_id, protocol_version, arms=None, strata_factors=None, block_size=None, seed=None):
         with self.connect() as conn:
@@ -212,39 +268,454 @@ class RandomizationStore:
         row = conn.execute("SELECT * FROM strata WHERE trial_id=? AND stratum_key=?", (trial["id"], key)).fetchone()
         if row:
             return row
+        planned = trial["stratum_planned"] if "stratum_planned" in trial.keys() else 50
         cur = conn.execute(
-            "INSERT INTO strata(trial_id,stratum_key,factors_json,created_at) VALUES(?,?,?,?)",
-            (trial["id"], key, json.dumps({"site_id": site_id, **normalized}, ensure_ascii=False, sort_keys=True), now()),
+            "INSERT INTO strata(trial_id,stratum_key,factors_json,planned_count,created_at) VALUES(?,?,?,?,?)",
+            (trial["id"], key, json.dumps({"site_id": site_id, **normalized}, ensure_ascii=False, sort_keys=True), planned, now()),
         )
         return conn.execute("SELECT * FROM strata WHERE id=?", (cur.lastrowid,)).fetchone()
 
+    def _ensure_block(self, conn, trial, stratum, block_no):
+        """若第 block_no 个区组尚未生成，则按种子确定性生成（分组固定，不随预占/发号变化）。"""
+        count = conn.execute(
+            "SELECT COUNT(*) FROM allocations WHERE stratum_id=? AND block_no=?", (stratum["id"], block_no)
+        ).fetchone()[0]
+        if count:
+            return
+        rng = random.Random(f"{trial['seed']}:{stratum['stratum_key']}:{block_no}")
+        arms = json.loads(trial["arms_json"])
+        plan = []
+        blocks = len(arms) if trial["block_size"] > len(arms) else 1
+        for _ in range(blocks * (trial["block_size"] // len(arms))):
+            plan.extend(arms)
+        rng.shuffle(plan)
+        start = conn.execute(
+            "SELECT COALESCE(MAX(sequence),0) FROM allocations WHERE stratum_id=?", (stratum["id"],)
+        ).fetchone()[0]
+        for offset, arm in enumerate(plan, 1):
+            conn.execute(
+                "INSERT INTO allocations(trial_id,stratum_id,sequence,block_no,arm) VALUES(?,?,?,?,?)",
+                (trial["id"], stratum["id"], start + offset, block_no, arm),
+            )
+
     def _next_allocation(self, conn, trial, stratum):
-        for block_no in range(1, 101):
-            count = conn.execute(
-                "SELECT COUNT(*) FROM allocations WHERE stratum_id=? AND block_no=?", (stratum["id"], block_no)
-            ).fetchone()[0]
-            if count == 0:
-                rng = random.Random(f"{trial['seed']}:{stratum['stratum_key']}:{block_no}")
-                arms = json.loads(trial["arms_json"])
-                plan = []
-                blocks = len(arms) if trial["block_size"] > len(arms) else 1
-                for _ in range(blocks * (trial["block_size"] // len(arms))):
-                    plan.extend(arms)
-                rng.shuffle(plan)
-                start = conn.execute(
-                    "SELECT COALESCE(MAX(sequence),0) FROM allocations WHERE stratum_id=?", (stratum["id"],)
-                ).fetchone()[0]
-                for offset, arm in enumerate(plan, 1):
-                    conn.execute(
-                        "INSERT INTO allocations(trial_id,stratum_id,sequence,block_no,arm) VALUES(?,?,?,?,?)",
-                        (trial["id"], stratum["id"], start + offset, block_no, arm),
-                    )
+        for block_no in range(1, 201):
+            self._ensure_block(conn, trial, stratum, block_no)
             free = conn.execute(
                 "SELECT * FROM allocations WHERE stratum_id=? AND used_by IS NULL ORDER BY sequence LIMIT 1", (stratum["id"],)
             ).fetchone()
             if free:
                 return free
         raise BusinessError("随机分配表已耗尽，请由统计人员扩展方案", 409, "allocation_exhausted")
+
+    def _free_runs(self, conn, stratum):
+        """返回分层内未发号、未被有效预占、且不超过计划人数的连续号段区间 [start,end]。"""
+        planned = stratum["planned_count"]
+        rows = conn.execute(
+            """SELECT sequence FROM allocations
+               WHERE stratum_id=? AND used_by IS NULL AND reservation_id IS NULL AND sequence<=?
+               ORDER BY sequence""",
+            (stratum["id"], planned),
+        ).fetchall()
+        runs = []
+        start = prev = None
+        for row in rows:
+            seq = row["sequence"]
+            if start is None:
+                start = prev = seq
+            elif seq == prev + 1:
+                prev = seq
+            else:
+                runs.append((start, prev))
+                start = prev = seq
+        if start is not None:
+            runs.append((start, prev))
+        return runs
+
+    def _ensure_run(self, conn, trial, stratum, count):
+        """找到长度至少为 count 的连续空号段；优先复用过期退回的小号段，否则向上生成新区组。"""
+        for _ in range(400):
+            for start, end in self._free_runs(conn, stratum):
+                if end - start + 1 >= count:
+                    return start
+            block_no = conn.execute(
+                "SELECT COALESCE(MAX(block_no),0)+1 FROM allocations WHERE stratum_id=?", (stratum["id"],)
+            ).fetchone()[0]
+            self._ensure_block(conn, trial, stratum, block_no)
+        raise BusinessError("号源不足，请等待退回或由统计人员扩展方案", 409, "allocation_exhausted")
+
+    def _ensure_cover(self, conn, trial, stratum, upto):
+        """生成区组直到该分层的最大序号覆盖 upto（显式起始号时需要先有号源）。"""
+        for _ in range(400):
+            maxseq = conn.execute(
+                "SELECT COALESCE(MAX(sequence),0) FROM allocations WHERE stratum_id=?", (stratum["id"],)
+            ).fetchone()[0]
+            if maxseq >= upto:
+                return
+            block_no = conn.execute(
+                "SELECT COALESCE(MAX(block_no),0)+1 FROM allocations WHERE stratum_id=?", (stratum["id"],)
+            ).fetchone()[0]
+            self._ensure_block(conn, trial, stratum, block_no)
+        raise BusinessError("号源不足，请等待退回或由统计人员扩展方案", 409, "allocation_exhausted")
+
+    @staticmethod
+    def _overlaps(a_start, a_end, b_start, b_end):
+        return a_start <= b_end and b_start <= a_end
+
+    def _expire_due(self, conn, trial_id):
+        """把已到期预占中未发完的号退回中央池，释放对应药品备货，并按 FIFO 补排队申请。"""
+        ts = now()
+        due = conn.execute(
+            "SELECT * FROM reservations WHERE trial_id=? AND status='active' AND expires_at IS NOT NULL AND expires_at<=? ORDER BY id",
+            (trial_id, ts),
+        ).fetchall()
+        for res in due:
+            conn.execute(
+                "UPDATE allocations SET reservation_id=NULL WHERE reservation_id=? AND used_by IS NULL",
+                (res["id"],),
+            )
+            conn.execute(
+                "UPDATE drug_records SET status='returned' WHERE reservation_id=? AND status='stocked'",
+                (res["id"],),
+            )
+            conn.execute("UPDATE reservations SET status='expired' WHERE id=?", (res["id"],))
+            self._audit(conn, trial_id, res["created_by"], "reservation.expired", {
+                "reservation_id": res["id"], "site_id": res["site_id"],
+                "seq_start": res["seq_start"], "seq_end": res["seq_end"],
+            })
+        if due:
+            self._fulfill_queue(conn, trial_id)
+        return due
+
+    def _counts(self, conn, stratum_id):
+        issued = conn.execute(
+            "SELECT COUNT(*) FROM allocations WHERE stratum_id=? AND used_by IS NOT NULL", (stratum_id,)
+        ).fetchone()[0]
+        reserved = conn.execute(
+            """SELECT COUNT(*) FROM allocations a JOIN reservations r ON r.id=a.reservation_id
+               WHERE a.stratum_id=? AND a.used_by IS NULL AND r.status='active'""",
+            (stratum_id,),
+        ).fetchone()[0]
+        return issued, reserved
+
+    def _grant(self, conn, trial, stratum, count, seq_start):
+        """事务内分配一个号段（不写预占行）。返回 (seq_start, seq_end)；计划已满返回 None。"""
+        issued, reserved = self._counts(conn, stratum["id"])
+        planned = stratum["planned_count"]
+        if issued + reserved + count > planned:
+            return None
+        if seq_start is None:
+            seq_start = self._ensure_run(conn, trial, stratum, count)
+        seq_end = seq_start + count - 1
+        self._ensure_cover(conn, trial, stratum, seq_end)
+        conflict = conn.execute(
+            """SELECT * FROM reservations
+               WHERE stratum_id=? AND status='active' AND seq_start<=? AND seq_end>=?
+               ORDER BY id LIMIT 1""",
+            (stratum["id"], seq_end, seq_start),
+        ).fetchone()
+        if conflict:
+            remaining = [{"seq_start": a, "seq_end": b} for a, b in self._free_runs(conn, stratum)]
+            raise BusinessError(
+                "申请的号段与已生效预占冲突", 409, "range_conflict",
+                extra={"conflict_reservation_id": conflict["id"],
+                       "desired": {"seq_start": seq_start, "seq_end": seq_end},
+                       "held": {"seq_start": conflict["seq_start"], "seq_end": conflict["seq_end"], "site_id": conflict["site_id"]},
+                       "remaining": remaining},
+            )
+        return seq_start, seq_end
+
+    def _try_grant(self, conn, trial, stratum, site_id, count, expires_at, user_id, seq_start, allow_queue):
+        """在 BEGIN IMMEDIATE 事务内调用：排队 / 冲突 / 落库三选一，绝不留下半条。"""
+        granted = self._grant(conn, trial, stratum, count, seq_start)
+        if granted is None:
+            if not allow_queue:
+                return None
+            queue_no = conn.execute(
+                "SELECT COALESCE(MAX(queue_no),0)+1 FROM reservations WHERE trial_id=? AND status='queued'",
+                (trial["id"],),
+            ).fetchone()[0]
+            cur = conn.execute(
+                """INSERT INTO reservations(trial_id,stratum_id,site_id,count,status,queue_no,requested_count,created_by,created_at)
+                   VALUES(?,?,?,0,'queued',?,?,?,?)""",
+                (trial["id"], stratum["id"], site_id, queue_no, count, user_id, now()),
+            )
+            self._audit(conn, trial["id"], user_id, "reservation.queued", {
+                "reservation_id": cur.lastrowid, "site_id": site_id, "count": count,
+                "queue_no": queue_no, "planned": stratum["planned_count"],
+            })
+            return {"status": "queued", "reservation_id": cur.lastrowid, "queue_no": queue_no,
+                    "planned": stratum["planned_count"]}
+        seq_start, seq_end = granted
+        cur = conn.execute(
+            """INSERT INTO reservations(trial_id,stratum_id,site_id,seq_start,seq_end,count,status,expires_at,requested_count,created_by,created_at)
+               VALUES(?,?,?,?,?,?,'active',?,?,?,?)""",
+            (trial["id"], stratum["id"], site_id, seq_start, seq_end, count, expires_at, count, user_id, now()),
+        )
+        reservation_id = cur.lastrowid
+        conn.execute(
+            "UPDATE allocations SET reservation_id=? WHERE stratum_id=? AND sequence>=? AND sequence<=?",
+            (reservation_id, stratum["id"], seq_start, seq_end),
+        )
+        self._audit(conn, trial["id"], user_id, "reservation.create", {
+            "reservation_id": reservation_id, "site_id": site_id, "stratum_id": stratum["id"],
+            "seq_start": seq_start, "seq_end": seq_end, "count": count, "expires_at": expires_at,
+        })
+        return {"status": "active", "reservation_id": reservation_id,
+                "seq_start": seq_start, "seq_end": seq_end, "count": count, "expires_at": expires_at}
+
+    def _fulfill_queue(self, conn, trial_id):
+        """号源退回中央池后，按排队顺序 FIFO 补号；补不上的继续排队。"""
+        queued = conn.execute(
+            "SELECT * FROM reservations WHERE trial_id=? AND status='queued' ORDER BY queue_no,id", (trial_id,)
+        ).fetchall()
+        for row in queued:
+            stratum = conn.execute("SELECT * FROM strata WHERE id=?", (row["stratum_id"],)).fetchone()
+            trial = conn.execute("SELECT * FROM trials WHERE id=?", (trial_id,)).fetchone()
+            try:
+                granted = self._grant(conn, trial, stratum, row["requested_count"], None)
+            except BusinessError:
+                granted = None
+            if granted is None:
+                continue
+            seq_start, seq_end = granted
+            conn.execute(
+                "UPDATE reservations SET status='active',seq_start=?,seq_end=?,count=?,expires_at=?,fulfilled_at=? WHERE id=?",
+                (seq_start, seq_end, row["requested_count"], row["expires_at"], now(), row["id"]),
+            )
+            conn.execute(
+                "UPDATE allocations SET reservation_id=? WHERE stratum_id=? AND sequence>=? AND sequence<=?",
+                (row["id"], stratum["id"], seq_start, seq_end),
+            )
+            self._audit(conn, trial_id, row["created_by"], "reservation.fulfilled", {
+                "reservation_id": row["id"], "seq_start": seq_start, "seq_end": seq_end, "queue_no": row["queue_no"],
+            })
+
+    def reserve_range(self, user_id, trial_id, factors, count, expires_at, seq_start=None):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1 or count > 1000:
+            raise BusinessError("号段数量必须为 1..1000 的整数", 422, "invalid_count")
+        expires_at = str(expires_at or "").strip()
+        try:
+            exp = datetime.fromisoformat(expires_at)
+        except ValueError:
+            raise BusinessError("失效时刻必须是 ISO 8601 时间", 422, "invalid_expires")
+        if exp.tzinfo is None:
+            raise BusinessError("失效时刻必须带时区", 422, "invalid_expires")
+        if expires_at <= now():
+            raise BusinessError("失效时刻必须晚于当前时间", 422, "invalid_expires")
+        if seq_start is not None:
+            if isinstance(seq_start, bool) or not isinstance(seq_start, int) or seq_start < 1:
+                raise BusinessError("起始号必须为正整数", 422, "invalid_seq_start")
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                trial = self._trial(conn, trial_id)
+                if trial["status"] != "running":
+                    raise BusinessError("试验尚未开始或已经停止", 409, "trial_not_running")
+                stratum = self._stratum(conn, trial, factors, actor["site_id"])
+                self._expire_due(conn, trial_id)
+                result = self._try_grant(conn, trial, stratum, actor["site_id"], count, expires_at, user_id, seq_start, allow_queue=True)
+                result["remaining"] = [{"seq_start": a, "seq_end": b} for a, b in self._free_runs(conn, stratum)]
+                conn.commit()
+                return result
+            except BusinessError:
+                conn.rollback()
+                raise
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_reservations(self, user_id, trial_id, status=None):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            self._expire_due(conn, trial_id)
+            sql = "SELECT r.*, s.factors_json FROM reservations r JOIN strata s ON s.id=r.stratum_id WHERE r.trial_id=?"
+            params = [trial_id]
+            if actor["role"] == "site":
+                sql += " AND r.site_id=?"
+                params.append(actor["site_id"])
+            if status:
+                sql += " AND r.status=?"
+                params.append(status)
+            sql += " ORDER BY r.id"
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(x) for x in rows]
+
+    def availability(self, user_id, trial_id, factors):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site"})
+            trial = self._trial(conn, trial_id)
+            self._expire_due(conn, trial_id)
+            stratum = self._stratum(conn, trial, factors, actor["site_id"])
+            issued, reserved = self._counts(conn, stratum["id"])
+            site_id = json.loads(stratum["factors_json"])["site_id"]
+            return {
+                "stratum_id": stratum["id"], "site_id": site_id,
+                "planned_count": stratum["planned_count"], "issued": issued, "reserved_active": reserved,
+                "free": stratum["planned_count"] - issued - reserved,
+                "remaining": [{"seq_start": a, "seq_end": b} for a, b in self._free_runs(conn, stratum)],
+            }
+
+    def stock_drugs(self, user_id, trial_id, reservation_id, packs):
+        if not isinstance(packs, list) or not packs or any(not str(p).strip() for p in packs):
+            raise BusinessError("药品包装号必须是非空数组", 422, "invalid_packs")
+        packs = [str(p).strip() for p in packs]
+        if len(set(packs)) != len(packs):
+            raise BusinessError("药品包装号不能重复", 422, "invalid_packs")
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site"})
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                reservation = conn.execute(
+                    "SELECT * FROM reservations WHERE id=? AND trial_id=?", (reservation_id, trial_id)
+                ).fetchone()
+                if not reservation:
+                    raise BusinessError("预占记录不存在", 404, "not_found")
+                if reservation["site_id"] != actor["site_id"]:
+                    raise BusinessError("不能为其他中心的预占备货", 403, "site_isolation")
+                if reservation["status"] != "active":
+                    raise BusinessError("只有生效中的预占可以备货", 409, "reservation_not_active")
+                unused = conn.execute(
+                    """SELECT a.id,a.sequence FROM allocations a
+                       WHERE a.reservation_id=? AND a.used_by IS NULL AND a.sequence>=?
+                       ORDER BY a.sequence""",
+                    (reservation_id, reservation["seq_start"]),
+                ).fetchall()
+                if len(packs) > len(unused):
+                    raise BusinessError(f"备货数量超过未发号余量（剩余 {len(unused)} 个号）", 422, "too_many_packs")
+                for pack in packs:
+                    if conn.execute("SELECT 1 FROM drug_records WHERE trial_id=? AND pack_no=?", (trial_id, pack)).fetchone():
+                        raise BusinessError(f"药品包装号已存在: {pack}", 409, "pack_exists")
+                stocked = 0
+                for pack, alloc in zip(packs, unused):
+                    conn.execute(
+                        """INSERT INTO drug_records(trial_id,site_id,reservation_id,allocation_id,pack_no,stocked_at,created_by)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (trial_id, actor["site_id"], reservation_id, alloc["id"], pack, now(), user_id),
+                    )
+                    stocked += 1
+                self._audit(conn, trial_id, user_id, "drug.stock", {
+                    "reservation_id": reservation_id, "packs": stocked, "site_id": actor["site_id"],
+                })
+                conn.commit()
+                return {"reservation_id": reservation_id, "stocked": stocked, "packs": packs}
+            except BusinessError:
+                conn.rollback()
+                raise
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _dispense_drug(self, conn, trial_id, allocation_id, user_id):
+        record = conn.execute(
+            "SELECT * FROM drug_records WHERE allocation_id=? AND status='stocked'", (allocation_id,)
+        ).fetchone()
+        if record:
+            conn.execute(
+                "UPDATE drug_records SET status='dispensed',dispensed_at=? WHERE id=?", (now(), record["id"])
+            )
+            self._audit(conn, trial_id, user_id, "drug.dispensed", {
+                "drug_record_id": record["id"], "allocation_id": allocation_id, "pack_no": record["pack_no"],
+            })
+            return record["id"]
+        return None
+
+    def update_stratum_plan(self, user_id, trial_id, stratum_id, planned_count):
+        if isinstance(planned_count, bool) or not isinstance(planned_count, int) or planned_count < 2 or planned_count > 100000:
+            raise BusinessError("分层计划人数必须为 2..100000 的整数", 422, "invalid_planned")
+        with self.connect() as conn:
+            self._user(conn, user_id, {"coordinator"})
+            stratum = conn.execute("SELECT * FROM strata WHERE id=? AND trial_id=?", (stratum_id, trial_id)).fetchone()
+            if not stratum:
+                raise BusinessError("分层不存在", 404, "not_found")
+            issued, reserved = self._counts(conn, stratum_id)
+            if planned_count < issued + reserved:
+                raise BusinessError("计划人数不能小于已发号与有效预占之和", 409, "plan_below_usage")
+            conn.execute("UPDATE strata SET planned_count=? WHERE id=?", (planned_count, stratum_id))
+            self._audit(conn, trial_id, user_id, "stratum.plan", {"stratum_id": stratum_id, "planned_count": planned_count})
+            return {"stratum_id": stratum_id, "planned_count": planned_count}
+
+    def reconciliation(self, user_id, trial_id):
+        """审计员拿预占、发号、药品记录对账：三本号源账合一对平。"""
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            trial = self._trial(conn, trial_id)
+            self._expire_due(conn, trial_id)
+            strata_rows = conn.execute(
+                "SELECT * FROM strata WHERE trial_id=? ORDER BY id", (trial_id,)
+            ).fetchall()
+            strata_ledger = []
+            discrepancies = []
+            totals = {"reservations": 0, "issued": 0, "stocked": 0, "dispensed": 0, "returned": 0, "queued": 0}
+            for s in strata_rows:
+                factors = json.loads(s["factors_json"])
+                if actor["role"] == "site" and factors["site_id"] != actor["site_id"]:
+                    continue
+                issued, reserved = self._counts(conn, s["id"])
+                res_rows = conn.execute(
+                    "SELECT * FROM reservations WHERE stratum_id=? ORDER BY id", (s["id"],)
+                ).fetchall()
+                res_ledger = []
+                for r in res_rows:
+                    r_issued = conn.execute(
+                        "SELECT COUNT(*) FROM allocations WHERE reservation_id=? AND used_by IS NOT NULL", (r["id"],)
+                    ).fetchone()[0]
+                    r_unused = conn.execute(
+                        "SELECT COUNT(*) FROM allocations WHERE reservation_id=? AND used_by IS NULL", (r["id"],)
+                    ).fetchone()[0]
+                    stocked = conn.execute(
+                        "SELECT COUNT(*) FROM drug_records WHERE reservation_id=? AND status='stocked'", (r["id"],)
+                    ).fetchone()[0]
+                    dispensed = conn.execute(
+                        "SELECT COUNT(*) FROM drug_records WHERE reservation_id=? AND status='dispensed'", (r["id"],)
+                    ).fetchone()[0]
+                    returned = conn.execute(
+                        "SELECT COUNT(*) FROM drug_records WHERE reservation_id=? AND status='returned'", (r["id"],)
+                    ).fetchone()[0]
+                    entry = {"reservation_id": r["id"], "site_id": r["site_id"], "status": r["status"],
+                             "seq_start": r["seq_start"], "seq_end": r["seq_end"], "count": r["count"],
+                             "expires_at": r["expires_at"], "issued": r_issued, "unused": r_unused,
+                             "stocked": stocked, "dispensed": dispensed, "returned": returned,
+                             "queue_no": r["queue_no"]}
+                    res_ledger.append(entry)
+                    totals["reservations"] += 1
+                    totals["issued"] += r_issued
+                    totals["stocked"] += stocked
+                    totals["dispensed"] += dispensed
+                    totals["returned"] += returned
+                    if r["status"] == "queued":
+                        totals["queued"] += 1
+                    if r["status"] == "expired" and stocked + dispensed + returned > 0 and stocked + dispensed > 0:
+                        discrepancies.append({"type": "stock_not_returned_on_expiry", "reservation_id": r["id"],
+                                              "message": "过期预占仍有未退库的备货包装"})
+                # 已发号但没有任何药品记录（预占外发号或漏备货）
+                missing = conn.execute(
+                    """SELECT a.id FROM allocations a
+                       WHERE a.stratum_id=? AND a.used_by IS NOT NULL
+                         AND NOT EXISTS (SELECT 1 FROM drug_records d WHERE d.allocation_id=a.id)""",
+                    (s["id"],),
+                ).fetchall()
+                for m in missing:
+                    discrepancies.append({"type": "issued_without_stock", "allocation_id": m["id"],
+                                          "message": "已发号但无药品备货/发放记录"})
+                strata_ledger.append({"stratum_id": s["id"], "site_id": factors["site_id"], "factors": factors,
+                                      "planned_count": s["planned_count"], "issued": issued,
+                                      "reserved_active": reserved, "free": s["planned_count"] - issued - reserved,
+                                      "reservations": res_ledger})
+            # 已发放药品但号未发（账实不符），全试验只查一次
+            orphan = conn.execute(
+                """SELECT d.id FROM drug_records d
+                   LEFT JOIN allocations a ON a.id=d.allocation_id
+                   WHERE d.trial_id=? AND d.status='dispensed' AND (a.used_by IS NULL OR a.id IS NULL)""",
+                (trial_id,),
+            ).fetchall()
+            for o in orphan:
+                discrepancies.append({"type": "dispensed_without_issue", "drug_record_id": o["id"],
+                                      "message": "药品已发放但对应号未发"})
+            return {"trial": {"id": trial["id"], "name": trial["name"], "status": trial["status"]},
+                    "strata": strata_ledger, "totals": totals, "discrepancies": discrepancies}
 
     def enroll(self, user_id, trial_id, external_id, factors):
         external_id = str(external_id).strip()
@@ -266,7 +737,18 @@ class RandomizationStore:
                     conn.commit()
                     return self._blinded_participant(conn, existing, actor, allow_arm=False, idempotent=True)
                 stratum = self._stratum(conn, trial, factors, actor["site_id"])
-                allocation = self._next_allocation(conn, trial, stratum)
+                self._expire_due(conn, trial_id)
+                reserved = conn.execute(
+                    """SELECT a.* FROM allocations a
+                       JOIN reservations r ON r.id=a.reservation_id
+                       WHERE a.stratum_id=? AND a.used_by IS NULL AND r.status='active'
+                       ORDER BY r.expires_at ASC, a.sequence ASC LIMIT 1""",
+                    (stratum["id"],),
+                ).fetchone()
+                if reserved:
+                    allocation = reserved
+                else:
+                    allocation = self._next_allocation(conn, trial, stratum)
                 allocation_code = hashlib.sha256(f"{trial_id}:{external_id}".encode()).hexdigest()[:12].upper()
                 cur = conn.execute(
                     """INSERT INTO participants(trial_id,site_id,external_id,stratum_id,allocation_id,allocation_code,enrolled_by,created_at)
@@ -275,6 +757,7 @@ class RandomizationStore:
                 )
                 participant_id = cur.lastrowid
                 conn.execute("UPDATE allocations SET used_by=?,used_at=? WHERE id=?", (participant_id, now(), allocation["id"]))
+                self._dispense_drug(conn, trial_id, allocation["id"], user_id)
                 self._audit(conn, trial_id, user_id, "participant.enroll", {"participant_id": participant_id, "external_id": external_id, "allocation_id": allocation["id"], "site_id": actor["site_id"]})
                 participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
                 return self._blinded_participant(conn, participant, actor, allow_arm=False, idempotent=False)
@@ -416,7 +899,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers(); self.wfile.write(body); return
         if method == "GET" and path == "/health": return self._send(200, {"ok": True})
         if parts == ["api", "trials"] and method == "POST":
-            d=self._body(); return self._send(201, store.create_trial(user,d.get("name",""),d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed","")))
+            d=self._body(); return self._send(201, store.create_trial(user,d.get("name",""),d.get("protocol_version",""),d.get("arms"),d.get("strata_factors"),d.get("block_size"),d.get("seed",""),d.get("stratum_planned",50)))
         if len(parts) >= 3 and parts[:2] == ["api", "trials"]:
             trial_id=int(parts[2])
             if len(parts)==4 and parts[3]=="protocol" and method=="POST":
@@ -426,6 +909,20 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
+            if len(parts)==4 and parts[3]=="reservations" and method=="POST":
+                d=self._body(); return self._send(201, store.reserve_range(user,trial_id,d.get("factors",{}),d.get("count"),d.get("expires_at",""),d.get("seq_start")))
+            if len(parts)==4 and parts[3]=="reservations" and method=="GET":
+                return self._send(200, {"items": store.list_reservations(user,trial_id)})
+            if len(parts)==4 and parts[3]=="availability" and method=="GET":
+                from urllib.parse import parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                factors = json.loads(qs.get("factors",["{}"])[0])
+                return self._send(200, store.availability(user,trial_id,factors))
+            if len(parts)==4 and parts[3]=="reconciliation" and method=="GET": return self._send(200, store.reconciliation(user,trial_id))
+            if len(parts)==6 and parts[3]=="reservations" and parts[5]=="drug-stock" and method=="POST":
+                d=self._body(); return self._send(201, store.stock_drugs(user,trial_id,int(parts[4]),d.get("packs",[])))
+            if len(parts)==6 and parts[3]=="strata" and parts[5]=="plan" and method=="POST":
+                d=self._body(); return self._send(200, store.update_stratum_plan(user,trial_id,int(parts[4]),d.get("planned_count")))
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
@@ -434,7 +931,9 @@ class Handler(BaseHTTPRequestHandler):
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)
-        except BusinessError as exc: self._send(exc.status,{"error":{"code":exc.code,"message":exc.message}})
+        except BusinessError as exc:
+            body = {"error": {"code": exc.code, "message": exc.message, **exc.extra}}
+            self._send(exc.status, body)
         except (ValueError,TypeError): self._send(400,{"error":{"code":"invalid_path","message":"路径参数格式错误"}})
         except Exception as exc: self._send(500,{"error":{"code":"internal_error","message":str(exc)}})
     def do_GET(self): self._handle("GET")
