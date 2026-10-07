@@ -1,0 +1,4 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
+<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
+<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
+<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
