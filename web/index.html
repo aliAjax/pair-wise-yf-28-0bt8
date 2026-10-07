@@ -1,4 +1,71 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化 · 号源账</title>
+<style>
+body{font:15px system-ui;max-width:1100px;margin:28px auto;padding:0 16px;color:#222}
+select,input,button{padding:7px;margin:3px;font-size:14px}
+button{cursor:pointer}
+pre{background:#f5f5f5;padding:12px;white-space:pre-wrap;border-radius:6px;max-height:60vh;overflow:auto}
+.panel{border:1px solid #bbb;padding:14px;border-radius:8px;margin-bottom:14px}
+.row{margin:6px 0}
+label{color:#555;margin-right:6px}
+h2{font-size:17px;margin:0 0 8px}
+</style></head>
+<body>
+<h1>临床试验随机分配与盲法 · 号源账</h1>
+<div class="panel">
+  <div class="row"><label>用户</label>
+    <select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select>
+    <label>试验</label><input id="trial" value="1" style="width:60px">
+  </div>
+  <div class="row">
+    <button onclick="get('summary')">试验摘要</button>
+    <button onclick="get('ledger')">审计对账(ledger)</button>
+    <button onclick="get('reservations')">号段与排队</button>
+    <button onclick="post('sweep-expired',{})">清扫过期号段</button>
+  </div>
+</div>
+<div class="panel">
+  <h2>协调员：按分层下达计划人数</h2>
+  <input id="plan" style="width:520px" value='{"strata_plans":[{"factors":{"risk":"low"},"planned_count":8},{"factors":{"risk":"high"},"planned_count":8}]}'>
+  <button onclick="post('plans', plan)">下达计划</button>
+</div>
+<div class="panel">
+  <h2>中心：按分层申请号段（写下失效时刻，提前备货）</h2>
+  <input id="factors" style="width:150px" value='{"risk":"low"}'>
+  <label>号数</label><input id="size" value="4" style="width:60px">
+  <label>失效(分钟)</label><input id="ttl" value="60" style="width:70px">
+  <label>代申请中心</label><input id="site" placeholder="coord 代申请必填" style="width:110px">
+  <label>幂等token</label><input id="token" placeholder="可选" style="width:120px">
+  <button onclick="reserve()">申请号段并备货</button>
+</div>
+<div class="panel">
+  <h2>中心：受试者入组发号（从本中心有效号段取号并发药盒）</h2>
+  <input id="ext" placeholder="外部受试者编号" style="width:180px">
+  <input id="efactors" style="width:150px" value='{"risk":"low"}'>
+  <button onclick="enroll()">入组发号</button>
+</div>
+<pre id="out">就绪。先由 coord 下达计划，再由 site 申请号段。</pre>
+<script>
+const $=id=>document.getElementById(id);
+async function call(method,path,body){
+  const opt={method,headers:{"X-User-Id":$("user").value,"Content-Type":"application/json"}};
+  if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(`/api/trials/${$("trial").value}/${path}`,opt);
+  show(r.status,await r.json());
+}
+const get=p=>call("GET",p);
+const post=(p,id)=>call("POST",p,typeof id==="string"?JSON.parse($(id).value):id);
+function show(status,data){out.textContent=`HTTP ${status}\n`+JSON.stringify(data,null,2)}
+function reserve(){
+  const body={factors:JSON.parse($("factors").value),size:parseInt(size.value),ttl_minutes:parseInt(ttl.value)};
+  if($("site").value.trim())body.site_id=$("site").value.trim();
+  if($("token").value.trim())body.client_token=$("token").value.trim();
+  call("POST","reservations",body);
+}
+function enroll(){
+  fetch(`/api/trials/${$("trial").value}/enroll`,{method:"POST",
+    headers:{"X-User-Id":$("user").value,"Content-Type":"application/json"},
+    body:JSON.stringify({external_id:$("ext").value.trim(),factors:JSON.parse($("efactors").value)})})
+    .then(async r=>show(r.status,await r.json()));
+}
+</script>
+</body></html>
